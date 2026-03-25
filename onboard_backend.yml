@@ -1,0 +1,395 @@
+---
+# ============================================================
+# onboard_backend.yml — New Client Backend Server Setup
+#
+# Usage:
+#   Test on DevLab:  ansible-playbook playbooks/onboard_backend.yml
+#   Specific client: ansible-playbook playbooks/onboard_backend.yml -e "target=paisaanytime_backend"
+#   With token:      ansible-playbook playbooks/onboard_backend.yml -e "target=paisaanytime_backend vault_github_token=ghp_xxx"
+#
+# Before running:
+#   1. Add server to hosts.ini
+#   2. Add .env file to env-files/los-backend.env
+#   3. Add nginx config to nginx-config/backend-nginx.conf
+#   4. Add SSH key to ~/.ssh/
+# ============================================================
+
+- name: Onboard New Backend Server
+  hosts: "{{ target | default('devlab') }}"
+  become: yes
+  vars:
+    github_org: "8byteAi"
+    repo_name: "los-backend"
+    repo_url: "https://github.com/{{ github_org }}/{{ repo_name }}.git"
+    app_dir: "/home/ubuntu/{{ repo_name }}"
+    app_branch: "e6682b45"
+    node_version: "20"
+    app_port: 4002
+    certbot_email: "debjyoti@8byte.ai"
+    nginx_config_src: "{{ playbook_dir }}/../nginx-config/backend-nginx.conf"
+
+  tasks:
+
+    # ── SYSTEM UPDATE ─────────────────────────────────
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Upgrade system packages
+      apt:
+        upgrade: yes
+
+    - name: Install essential packages
+      apt:
+        name:
+          - curl
+          - wget
+          - git
+          - build-essential
+          - certbot
+          - python3-certbot-nginx
+          - htop
+          - unzip
+          - net-tools
+        state: present
+
+    # ── NODE.JS ───────────────────────────────────────
+    - name: Check if Node.js is installed
+      shell: node --version 2>/dev/null || echo "not installed"
+      register: node_check
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Install Node.js {{ node_version }} LTS
+      shell: |
+        curl -fsSL https://deb.nodesource.com/setup_{{ node_version }}.x | bash -
+        apt-get install -y nodejs
+      when: "'not installed' in node_check.stdout or node_check.rc != 0"
+
+    - name: Verify Node.js version
+      shell: node --version
+      register: node_version_check
+      changed_when: false
+
+    - name: Show Node.js version
+      debug:
+        msg: "Node.js installed: {{ node_version_check.stdout }}"
+
+    # ── PM2 ───────────────────────────────────────────
+    - name: Install PM2 globally
+      npm:
+        name: pm2
+        global: yes
+        state: present
+
+    - name: Setup PM2 startup on boot
+      shell: pm2 startup systemd -u ubuntu --hp /home/ubuntu
+      register: pm2_startup
+      ignore_errors: yes
+
+    - name: Enable PM2 systemd service
+      shell: "{{ pm2_startup.stdout_lines | select('match', '^sudo') | first }}"
+      when:
+        - pm2_startup.rc == 0
+        - pm2_startup.stdout_lines | select('match', '^sudo') | list | length > 0
+      ignore_errors: yes
+
+    # ── NGINX ─────────────────────────────────────────
+    - name: Install Nginx
+      apt:
+        name: nginx
+        state: present
+
+    - name: Start and enable Nginx
+      systemd:
+        name: nginx
+        state: started
+        enabled: yes
+
+    - name: Remove default nginx site (sites-enabled)
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+
+    - name: Remove default nginx site (sites-available)
+      file:
+        path: /etc/nginx/sites-available/default
+        state: absent
+
+    # ── READ NGINX CONFIG ─────────────────────────────
+    - name: Check nginx config exists locally
+      local_action:
+        module: stat
+        path: "{{ nginx_config_src }}"
+      register: nginx_config_file
+      become: no
+
+    - name: Fail if nginx config missing
+      fail:
+        msg: "❌ nginx-config/backend-nginx.conf not found! Please add it before running."
+      when: not nginx_config_file.stat.exists
+
+    - name: Read nginx config content
+      local_action:
+        module: slurp
+        src: "{{ nginx_config_src }}"
+      register: nginx_config_content
+      become: no
+
+    - name: Extract domain from nginx config
+      set_fact:
+        nginx_domain: "{{ (nginx_config_content.content | b64decode) | regex_search('server_name\\s+([^;]+);', '\\1') | first | trim }}"
+
+    - name: Extract brand name from domain
+      set_fact:
+        brand_name: "{{ nginx_domain.split('.')[1] if nginx_domain.split('.') | length >= 2 else nginx_domain.split('.')[0] }}"
+
+    - name: Show extracted values
+      debug:
+        msg: |
+          🌐 Domain    : {{ nginx_domain }}
+          🏷️  Brand name : {{ brand_name }}
+
+    # ── CONFIGURE NGINX ───────────────────────────────
+    - name: Copy nginx config to sites-available
+      copy:
+        src: "{{ nginx_config_src }}"
+        dest: "/etc/nginx/sites-available/{{ brand_name }}"
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Enable nginx site (symlink to sites-enabled)
+      file:
+        src: "/etc/nginx/sites-available/{{ brand_name }}"
+        dest: "/etc/nginx/sites-enabled/{{ brand_name }}"
+        state: link
+
+    - name: Test nginx configuration
+      shell: nginx -t
+      register: nginx_test
+      changed_when: false
+
+    - name: Fail if nginx config is invalid
+      fail:
+        msg: "❌ Nginx config test failed! Check your backend-nginx.conf file."
+      when: nginx_test.rc != 0
+
+    - name: Reload nginx
+      systemd:
+        name: nginx
+        state: reloaded
+
+    # ── SSL CERTIFICATE ───────────────────────────────
+    - name: Obtain or reinstall SSL certificate via Certbot
+      shell: >
+        certbot --nginx
+        -d {{ nginx_domain }}
+        --email {{ certbot_email }}
+        --agree-tos
+        --no-eff-email
+        --non-interactive
+        --redirect
+        --keep-until-expiring
+      register: certbot_result
+      ignore_errors: yes
+
+    - name: Reload nginx after SSL
+      systemd:
+        name: nginx
+        state: reloaded
+
+
+    # ── GIT CREDENTIALS ───────────────────────────────
+    - name: Set git credential helper
+      shell: git config --global credential.helper store
+      become_user: ubuntu
+      changed_when: false
+
+    - name: Write git credentials from vault
+      copy:
+        content: "https://debjyoti27:{{ vault_github_token }}@github.com\n"
+        dest: /home/ubuntu/.git-credentials
+        owner: ubuntu
+        group: ubuntu
+        mode: '0600'
+
+    # ── CLONE APP ─────────────────────────────────────
+    - name: Create app directory
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: '0755'
+
+    - name: Clone application repository
+      git:
+        repo: "{{ repo_url }}"
+        dest: "{{ app_dir }}"
+        version: "{{ app_branch }}"
+        force: yes
+      become_user: ubuntu
+
+    - name: Set ownership of app directory
+      file:
+        path: "{{ app_dir }}"
+        owner: ubuntu
+        group: ubuntu
+        recurse: yes
+
+    # ── ENVIRONMENT ───────────────────────────────────
+    - name: Check env file exists locally
+      local_action:
+        module: stat
+        path: "{{ playbook_dir }}/../env-files/los-backend.env"
+      register: env_file
+      become: no
+
+    - name: Copy .env file to server
+      copy:
+        src: "{{ playbook_dir }}/../env-files/los-backend.env"
+        dest: "{{ app_dir }}/.env"
+        owner: ubuntu
+        group: ubuntu
+        mode: '0600'
+      when: env_file.stat.exists
+
+    - name: Warn if env file missing
+      debug:
+        msg: "⚠️ WARNING: env-files/los-backend.env not found! App may not start correctly."
+      when: not env_file.stat.exists
+
+
+    # ── INSTALL DEPENDENCIES ─────────────────────────────────────
+    - name: Install NPM dependencies
+      shell: npm install --fetch-retry-mintimeout 20000 --fetch-retry-maxtimeout 120000 --fetch-retries 5
+      args:
+        chdir: "{{ app_dir }}"
+      become_user: ubuntu
+
+    # ── PRISMA ────────────────────────────────────────
+    - name: Run Prisma migrations
+      shell: npx prisma migrate deploy
+      args:
+        chdir: "{{ app_dir }}"
+      become_user: ubuntu
+      ignore_errors: yes
+
+    - name: Generate Prisma client
+      shell: npx prisma generate
+      args:
+        chdir: "{{ app_dir }}"
+      become_user: ubuntu
+
+    # ── BUILD APP ─────────────────────────────────────
+    - name: Build the application
+      shell: |
+        export NODE_OPTIONS="--max-old-space-size=4096"
+        npm run build
+      args:
+        chdir: "{{ app_dir }}"
+      become_user: ubuntu
+      register: build_result
+
+    - name: Show build result
+      debug:
+        msg: "Build {{ 'SUCCESS' if build_result.rc == 0 else 'FAILED' }}"
+
+    # ── START APP ─────────────────────────────────────
+    - name: Start application with PM2
+      shell: npm run pm2:start
+      args:
+        chdir: "{{ app_dir }}"
+      become_user: ubuntu
+      register: pm2_start
+      ignore_errors: yes
+
+    - name: Save PM2 process list
+      shell: pm2 save --force
+      become_user: ubuntu
+
+    # ── VERIFY ────────────────────────────────────────
+    - name: Wait for app to start
+      wait_for:
+        port: "{{ app_port }}"
+        delay: 10
+        timeout: 60
+      ignore_errors: yes
+
+    - name: Check PM2 status after start
+      shell: pm2 list --no-color 2>/dev/null | grep -c online || echo "0"
+      become_user: ubuntu
+      register: pm2_final
+      changed_when: false
+
+    - name: Check nginx status
+      shell: systemctl is-active nginx
+      register: nginx_final
+      changed_when: false
+
+    - name: Check SSL cert status
+      stat:
+        path: "/etc/letsencrypt/live/{{ nginx_domain }}/fullchain.pem"
+      register: ssl_final
+
+    # ── FINAL REPORT ──────────────────────────────────
+    - name: Onboarding complete report
+      debug:
+        msg: |
+          ╔══════════════════════════════════════════════╗
+                  BACKEND ONBOARDING COMPLETE
+          ╠══════════════════════════════════════════════╣
+           SERVER     : {{ inventory_hostname }}
+           IP         : {{ ansible_host }}
+           OS         : {{ ansible_distribution }} {{ ansible_distribution_version }}
+           NODE       : {{ node_version_check.stdout }}
+           APP DIR    : {{ app_dir }}
+           BRANCH     : {{ app_branch }}
+          ╠══════════════════════════════════════════════╣
+           NGINX      : {{ nginx_final.stdout }}
+           BRAND      : {{ brand_name }}
+           DOMAIN     : {{ nginx_domain }}
+           SSL        : {{ '✅ Active' if ssl_final.stat.exists else '❌ Not configured' }}
+           PM2        : {{ pm2_final.stdout }} process(es) online
+          ╠══════════════════════════════════════════════╣
+           BUILD      : {{ 'SUCCESS ✅' if build_result.rc == 0 else 'FAILED ❌' }}
+           APP PORT   : {{ app_port }}
+           API URL    : https://{{ nginx_domain }}/api/v1/health
+          ╚══════════════════════════════════════════════╝
+
+    - name: ALERT — PM2 not running after install
+      fail:
+        msg: |
+          🚨 CRITICAL: App not running after install on {{ inventory_hostname }}!
+          Check: pm2 logs
+          Check: cat {{ app_dir }}/.env
+      when: pm2_final.stdout | int == 0
+      ignore_errors: yes
+
+
+    # ── SSH HARDENING ─────────────────────────────────
+    - name: Disable root SSH login
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^PermitRootLogin'
+        line: 'PermitRootLogin no'
+        backup: yes
+
+    - name: Disable password authentication
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^PasswordAuthentication'
+        line: 'PasswordAuthentication no'
+
+    - name: Disable DNS lookup on SSH
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^UseDNS'
+        line: 'UseDNS no'
+
+    - name: Restart SSH
+      systemd:
+        name: ssh
+        state: restarted
