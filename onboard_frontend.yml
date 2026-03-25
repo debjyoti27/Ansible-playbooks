@@ -1,0 +1,377 @@
+---
+# ============================================================
+# onboard_frontend.yml — New Client Frontend Server Setup
+#
+# Usage:
+#   Test on DevLab:  ansible-playbook playbooks/onboard_frontend.yml
+#   Specific client: ansible-playbook playbooks/onboard_frontend.yml -e "target=subhlakshmi_frontend"
+#   With token:      ansible-playbook playbooks/onboard_frontend.yml -e "target=subhlakshmi_frontend vault_github_token=ghp_xxx"
+#
+# Before running:
+#   1. Add server to hosts.ini
+#   2. Add nginx config to nginx-config/frontend-nginx.conf
+#   3. Add .env files to env-files/los-partner.env, los-webv1.env, los.env
+#   4. Add SSH key to ~/.ssh/
+# ============================================================
+
+- name: Onboard New Frontend Server
+  hosts: "{{ target | default('devlab') }}"
+  become: yes
+  vars:
+    github_org: "8byteAi"
+    node_version: "20"
+    certbot_email: "debjyoti@8byte.ai"
+    nginx_config_src: "{{ playbook_dir }}/../nginx-config/frontend-nginx.conf"
+
+    # ── FRONTEND REPOS ────────────────────────────────
+    frontends:
+      - name: "los-partner"
+        repo: "los-partner"
+        dir: "/home/ubuntu/los-partner"
+        branch: "prod"
+
+      - name: "los-webv1"
+        repo: "los-webv1"
+        dir: "/home/ubuntu/los-webv1"
+        branch: "prod"
+
+      - name: "los"
+        repo: "los"
+        dir: "/home/ubuntu/los"
+        branch: "toofanloan-lending"
+
+  tasks:
+
+    # ── SYSTEM UPDATE ─────────────────────────────────
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Upgrade system packages
+      apt:
+        upgrade: yes
+
+    - name: Install essential packages
+      apt:
+        name:
+          - curl
+          - wget
+          - git
+          - build-essential
+          - certbot
+          - python3-certbot-nginx
+          - htop
+          - unzip
+          - net-tools
+        state: present
+
+    # ── NODE.JS ───────────────────────────────────────
+    - name: Check if Node.js is installed
+      shell: node --version 2>/dev/null || echo "not installed"
+      register: node_check
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Install Node.js {{ node_version }} LTS
+      shell: |
+        curl -fsSL https://deb.nodesource.com/setup_{{ node_version }}.x | bash -
+        apt-get install -y nodejs
+      when: "'not installed' in node_check.stdout or node_check.rc != 0"
+
+    - name: Verify Node.js version
+      shell: node --version
+      register: node_version_check
+      changed_when: false
+
+    - name: Show Node.js version
+      debug:
+        msg: "Node.js installed: {{ node_version_check.stdout }}"
+
+    # ── NGINX ─────────────────────────────────────────
+    - name: Install Nginx
+      apt:
+        name: nginx
+        state: present
+
+    - name: Start and enable Nginx
+      systemd:
+        name: nginx
+        state: started
+        enabled: yes
+
+    - name: Remove default nginx site (sites-enabled)
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+
+    - name: Remove default nginx site (sites-available)
+      file:
+        path: /etc/nginx/sites-available/default
+        state: absent
+
+# ── READ NGINX CONFIG ─────────────────────────────
+    - name: Check nginx config exists locally
+      local_action:
+        module: stat
+        path: "{{ nginx_config_src }}"
+      register: nginx_config_file
+      become: no
+
+    - name: Fail if nginx config missing
+      fail:
+        msg: "❌ nginx-config/frontend-nginx.conf not found!"
+      when: not nginx_config_file.stat.exists
+
+    - name: Read nginx config content
+      local_action:
+        module: slurp
+        src: "{{ nginx_config_src }}"
+      register: nginx_config_content
+      become: no
+
+    - name: Extract all domains from nginx config
+      set_fact:
+        all_domains: "{{ (nginx_config_content.content | b64decode) | regex_findall('server_name\\s+([^;]+);') | map('trim') | list }}"
+
+    - name: Extract brand name from first domain
+      set_fact:
+        brand_name: "{{ all_domains[0].split('.')[1] }}"
+
+    - name: Show extracted values
+      debug:
+        msg: |
+          🌐 Domains   : {{ all_domains }}
+          🏷️  Brand name : {{ brand_name }}
+
+    # ── CONFIGURE NGINX ───────────────────────────────
+    - name: Copy nginx config to sites-available
+      copy:
+        src: "{{ nginx_config_src }}"
+        dest: "/etc/nginx/sites-available/{{ brand_name }}"
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Enable nginx site (symlink to sites-enabled)
+      file:
+        src: "/etc/nginx/sites-available/{{ brand_name }}"
+        dest: "/etc/nginx/sites-enabled/{{ brand_name }}"
+        state: link
+
+    - name: Test nginx configuration
+      shell: nginx -t
+      register: nginx_test
+      changed_when: false
+
+    - name: Fail if nginx config is invalid
+      fail:
+        msg: "❌ Nginx config test failed!"
+      when: nginx_test.rc != 0
+
+    - name: Reload nginx
+      systemd:
+        name: nginx
+        state: reloaded
+
+    # ── SSL CERTIFICATE ───────────────────────────────
+    - name: Obtain SSL certificates via Certbot for all domains
+      shell: >
+        certbot --nginx
+        {% for domain in all_domains %}-d {{ domain }} {% endfor %}
+        --email {{ certbot_email }}
+        --agree-tos
+        --no-eff-email
+        --non-interactive
+        --redirect
+        --keep-until-expiring
+      register: certbot_result
+      ignore_errors: yes
+
+    - name: Reload nginx after SSL
+      systemd:
+        name: nginx
+        state: reloaded
+
+
+    # ── GIT CREDENTIALS ───────────────────────────────
+    - name: Set git credential helper
+      shell: git config --global credential.helper store
+      become_user: ubuntu
+      changed_when: false
+
+    - name: Write git credentials from vault
+      copy:
+        content: "https://debjyoti27:{{ vault_github_token }}@github.com\n"
+        dest: /home/ubuntu/.git-credentials
+        owner: ubuntu
+        group: ubuntu
+        mode: '0600'
+
+    # ── CLONE ALL FRONTEND REPOS ──────────────────────
+    - name: Create app directories
+      file:
+        path: "{{ item.dir }}"
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: '0755'
+      loop: "{{ frontends }}"
+
+    - name: Clone frontend repositories
+      git:
+        repo: "https://github.com/{{ github_org }}/{{ item.repo }}.git"
+        dest: "{{ item.dir }}"
+        version: "{{ item.branch }}"
+        force: yes
+      become_user: ubuntu
+      loop: "{{ frontends }}"
+
+    - name: Set ownership of app directories
+      file:
+        path: "{{ item.dir }}"
+        owner: ubuntu
+        group: ubuntu
+        recurse: yes
+      loop: "{{ frontends }}"
+
+    # ── COPY ENV FILES ────────────────────────────────
+    - name: Check env file exists for los-partner
+      local_action:
+        module: stat
+        path: "{{ playbook_dir }}/../env-files/los-partner.env"
+      register: env_partner
+      become: no
+
+    - name: Copy .env for los-partner
+      copy:
+        src: "{{ playbook_dir }}/../env-files/los-partner.env"
+        dest: "/home/ubuntu/los-partner/.env"
+        owner: ubuntu
+        group: ubuntu
+        mode: '0600'
+      when: env_partner.stat.exists
+
+    - name: Check env file exists for los-webv1
+      local_action:
+        module: stat
+        path: "{{ playbook_dir }}/../env-files/los-webv1.env"
+      register: env_webv1
+      become: no
+
+    - name: Copy .env for los-webv1
+      copy:
+        src: "{{ playbook_dir }}/../env-files/los-webv1.env"
+        dest: "/home/ubuntu/los-webv1/.env"
+        owner: ubuntu
+        group: ubuntu
+        mode: '0600'
+      when: env_webv1.stat.exists
+
+    - name: Check env file exists for los
+      local_action:
+        module: stat
+        path: "{{ playbook_dir }}/../env-files/los.env"
+      register: env_los
+      become: no
+
+    - name: Copy .env for los
+      copy:
+        src: "{{ playbook_dir }}/../env-files/los.env"
+        dest: "/home/ubuntu/los/.env"
+        owner: ubuntu
+        group: ubuntu
+        mode: '0600'
+      when: env_los.stat.exists
+
+    # ── INSTALL & BUILD ALL FRONTENDS ─────────────────
+    - name: Install NPM dependencies for all frontends
+      shell: npm install --fetch-retry-mintimeout 20000 --fetch-retry-maxtimeout 120000 --fetch-retries 5
+      args:
+        chdir: "{{ item.dir }}"
+      become_user: ubuntu
+      loop: "{{ frontends }}"
+
+    - name: Build all frontends
+      shell: |
+        export NODE_OPTIONS="--max-old-space-size=4096"
+        npm run build
+      args:
+        chdir: "{{ item.dir }}"
+      become_user: ubuntu
+      loop: "{{ frontends }}"
+      register: build_results
+
+    - name: Show build results
+      debug:
+        msg: "Build {{ item.item.name }}: {{ 'SUCCESS ✅' if item.rc == 0 else 'FAILED ❌' }}"
+      loop: "{{ build_results.results }}"
+
+    # ── FIX PERMISSIONS ──────────────────────────────
+    - name: Fix permissions for nginx to access dist folders
+      shell: |
+        chmod 755 /home/ubuntu
+        chmod -R 755 /home/ubuntu/los-partner/dist
+        chmod -R 755 /home/ubuntu/los-webv1/dist
+        chmod -R 755 /home/ubuntu/los/dist
+
+    # ── VERIFY ────────────────────────────────────────
+    - name: Check nginx status
+      shell: systemctl is-active nginx
+      register: nginx_final
+      changed_when: false
+
+    - name: Check SSL cert status
+      stat:
+        path: "/etc/letsencrypt/live/{{ all_domains[0] }}/fullchain.pem"
+      register: ssl_final
+
+    # ── FINAL REPORT ──────────────────────────────────
+    - name: Onboarding complete report
+      debug:
+        msg: |
+          ╔══════════════════════════════════════════════╗
+                  FRONTEND ONBOARDING COMPLETE
+          ╠══════════════════════════════════════════════╣
+           SERVER     : {{ inventory_hostname }}
+           IP         : {{ ansible_host }}
+           OS         : {{ ansible_distribution }} {{ ansible_distribution_version }}
+           NODE       : {{ node_version_check.stdout }}
+          ╠══════════════════════════════════════════════╣
+           NGINX      : {{ nginx_final.stdout }}
+           BRAND      : {{ brand_name }}
+           SSL        : {{ '✅ Active' if ssl_final.stat.exists else '❌ Not configured' }}
+          ╠══════════════════════════════════════════════╣
+           CRM BUILD  : {{ 'SUCCESS ✅' if build_results.results[0].rc == 0 else 'FAILED ❌' }}
+           APP BUILD  : {{ 'SUCCESS ✅' if build_results.results[1].rc == 0 else 'FAILED ❌' }}
+           WEB BUILD  : {{ 'SUCCESS ✅' if build_results.results[2].rc == 0 else 'FAILED ❌' }}
+          ╠══════════════════════════════════════════════╣
+           CRM URL    : https://{{ all_domains[0] }}
+           APP URL    : https://{{ all_domains[1] }}
+           WEB URL    : https://{{ all_domains[2] }}
+          ╚══════════════════════════════════════════════╝
+
+    # ── SSH HARDENING ─────────────────────────────────
+    - name: Disable root SSH login
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^PermitRootLogin'
+        line: 'PermitRootLogin no'
+        backup: yes
+
+    - name: Disable password authentication
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^PasswordAuthentication'
+        line: 'PasswordAuthentication no'
+
+    - name: Disable DNS lookup on SSH
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^UseDNS'
+        line: 'UseDNS no'
+
+    - name: Restart SSH
+      systemd:
+        name: ssh
+        state: restarted
